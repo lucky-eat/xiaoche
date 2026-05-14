@@ -1,10 +1,7 @@
 /*
- * Copyright (c) 2021, Texas Instruments Incorporated
- * All rights reserved.
- *
- * ============================================================================
  * 循迹小车 — MSPM0G3507 + 八路并行红外传感器 + L298N 电机驱动
- * ============================================================================
+ *
+ * 基于 TI MSPM0 SDK empty 模板，CCS Theia + TICLANG 编译
  *
  * ============================================================================
  * 一、硬件接线
@@ -44,7 +41,7 @@
  * 二、控制策略
  * ============================================================================
  *
- * 传感器分工 (间距密, 线窄只覆盖1~2个探头):
+ * 传感器分工:
  *
  *      X1    X2    X3    X4    X5    X6    X7    X8
  *    最左                                        最右
@@ -54,15 +51,33 @@
  *   直角弯入口                             直角弯入口
  *      |←─────── X2~X7 直道纠偏 ────────────→|
  *
- * X1/X8 → 直角弯检测 (最外侧, 传感器灵敏一触即发)
+ * X1/X8 → 直角弯检测 (最外侧)
  * X2~X7 → 直道姿态纠正 (六路全参与, 低KP+高KD防摆头)
  *
- * 拐弯状态机:
- *   [直道] ──X1或X8触发(1帧)──→ [拐弯]
- *   [拐弯] ──X4/X5居中(1帧)──→ [直道]
+ * 拐弯状态机 (三阶段):
  *
- * 直道: 低速(45) + 低KP(5) + 高KD(10) = 温柔纠偏+强力阻尼, 不摆头
- * 拐弯: 低速(30) + 高KP(60) + 丢线锁±7 = 全力PD转向, X4/X5一帧即退
+ *   [直道] ──X1或X8触发──→ [拐弯-锁定]
+ *                              │ 前 MIN_CORNER_LOCK 帧:
+ *                              │  · 内侧轮反转, 外侧轮正转 (原地pivot)
+ *                              │  · 完全不检测退出条件
+ *                              │  · 不响应传感器
+ *                              ↓
+ *                          [拐弯-检测]
+ *                              │ 到达锁定帧数后:
+ *                              │  · 继续pivot转弯
+ *                              │  · 检测连续N帧 X4/X5居中
+ *                              ↓
+ *                          [拐弯-退出]
+ *                              │ X4/X5连续居中N帧 → 退出
+ *                              │ 进入 POST_CORNER 增强纠偏
+ *                              ↓
+ *                          [直道]
+ *
+ * 关键改进:
+ *   1. 最小锁定帧数: 确保车体至少转了足够角度才允许退出
+ *   2. Pivot原地转: 内侧轮反转, 不再只是"一边停一边走"
+ *   3. 退出检测延迟: 锁定结束后才开始检测居中, 避免过早退出
+ *   4. 退出后增强PD: 残余偏差用高KP快速纠正, 防止冲出赛道
  *
  * ============================================================================
  * 三、调参指南
@@ -72,11 +87,12 @@
  * ------------------------|---------------------------
  * 直道来回摆头              | 降 KP_STRAIGHT(-2), 还摆加 KD_STRAIGHT(+2)
  * 直道不居中(偏一边走)      | 升 KP_STRAIGHT(+3)
- * 直角弯拐不过来            | 降 CORNER_SPEED(-10), 或升 KP_CORNER(+20)
- * 直角弯误触发(直道进拐弯)  | 升 CORNER_DEBOUNCE(+1), 或检查传感器是否太灵敏
- * 直角弯过早退出            | 升 CORNER_EXIT_COUNT(+3)
- * 直角弯后冲出去            | 降 STRAIGHT_SPEED, 升 KD_STRAIGHT
- * 轮子转向反了              | 交换 CarMove 里的 ± 号
+ * 直角弯拐不过来(冲出)      | 升 MIN_CORNER_LOCK(+10), 或升 CORNER_PIVOT_PWR(+5)
+ * 直角弯转过头(转多了)      | 降 MIN_CORNER_LOCK(-5)
+ * 直角弯不退出(原地打转)    | 降 CORNER_MAX_FRAMES(-20), 降 CORNER_EXIT_COUNT(-2)
+ * 直角弯误触发(直道进拐弯)  | 升 CORNER_DEBOUNCE(+1)
+ * 直角弯后冲出去            | 升 POST_CORNER_KP(+10), 或升 POST_CORNER_FRAMES(+5)
+ * 轮子转向反了              | 交换 PivotTurn 里的正反转
  * 车不动 / 传感器不认线     | 检查 ACTIVE_LEVEL 是 0 还是 1
  *
  * ============================================================================
@@ -95,20 +111,23 @@
 #define PWM_PERIOD      32000
 
 /* ---- 速度 (0 ~ 32000) ---- */
-#define STRAIGHT_SPEED  45      /* 直道: 空载低速 */
-#define CORNER_SPEED    30      /* 拐弯基准速度, 低速+PD差速 */
+#define STRAIGHT_SPEED  45      /* 直道: 基础速度 */
+#define CORNER_SPEED    35      /* 拐弯外侧轮前进速度 */
+#define CORNER_PIVOT_PWR 25     /* 拐弯内侧轮反转速度 (pivot原地转) */
 
 /* ---- 直道 PD (温柔纠偏 + 强力阻尼) ---- */
 #define KP_STRAIGHT     5.0f    /* 低比例, 不摆头 */
 #define KD_STRAIGHT     10.0f   /* 高微分, 踩刹车防过冲 */
 
-/* ---- 拐弯 PD (强力转向) ---- */
-#define KP_CORNER       60.0f   /* 高比例, 确保转向 */
-#define KD_CORNER       1.0f    /* 轻阻尼, 不拖刹 */
+/* ---- 拐弯 (不要PD, 用固定pivot差速) ---- */
 
 /* ---- 拐弯状态机 ---- */
-#define CORNER_DEBOUNCE     1   /* 入口: 1帧即触发 */
-#define CORNER_EXIT_COUNT   1   /* 出口: 1帧居中即退出 */
+#define CORNER_DEBOUNCE     2   /* 入口: 连续2帧确认, 防误触发 */
+#define MIN_CORNER_LOCK    25   /* 锁定帧数: 至少转250ms才允许退出 */
+#define CORNER_EXIT_COUNT   6   /* 出口: 连续6帧居中确认 */
+#define CORNER_MAX_FRAMES  80   /* 安全超时: 80帧未退出则强制结束 (800ms) */
+#define POST_CORNER_FRAMES 12   /* 退出后增强纠偏帧数 */
+#define POST_CORNER_KP   20.0f  /* 退出后临时KP, 快速归中线 */
 
 /* ---- 丢线恢复 ---- */
 #define LOST_STEP        1      /* 每帧偏差递增量 */
@@ -213,23 +232,26 @@ static uint8_t IsLineCentered(uint8_t ir[8])
 }
 
 /* ============================================================================
- * PD_Calc — PD 控制器
+ * PD_Calc — PD 控制器 (仅直道和退出后增强阶段使用)
  *
- * output = KP * err + KD * (err - err_last)
- *
- * KP/KD 由调用者根据模式传入:
- *   直道: KP_STRAIGHT(10) + KD_STRAIGHT(8) → 温柔+阻尼
- *   拐弯: KP_CORNER(30) + KD_CORNER(3)     → 强力转向
+ * 拐弯阶段不调用 PD_Calc, err_last 保持旧值, 切换回 PD 模式时
+ * 会产生 derivative 尖峰。在进入需要 PD 的阶段前调用 PD_Reset()。
  * ============================================================================ */
+static int8_t pd_err_last;
+
 static int16_t PD_Calc(int8_t err, float kp, float kd)
 {
-    static int8_t err_last;
     int16_t output;
 
-    output = (int16_t)(kp * err + kd * (err - err_last));
-    err_last = err;
+    output = (int16_t)(kp * err + kd * (err - pd_err_last));
+    pd_err_last = err;
 
     return output;
+}
+
+static void PD_Reset(void)
+{
+    pd_err_last = 0;
 }
 
 /* ============================================================================
@@ -269,7 +291,8 @@ static void MotorRight(int16_t speed)
 }
 
 /*
- * 实际转弯方向相反时, 交换下面 left/right 的 ± 号。
+ * CarMove — 直道/退出后PD差速驱动
+ * left = base - Vz, right = base + Vz
  */
 static void CarMove(int16_t base_speed, int16_t Vz)
 {
@@ -287,15 +310,36 @@ static void CarMove(int16_t base_speed, int16_t Vz)
     MotorRight(right);
 }
 
+/*
+ * PivotTurn — 拐弯原地旋转
+ * dir > 0: 右转 → 左轮正转 + 右轮反转
+ * dir < 0: 左转 → 左轮反转 + 右轮正转
+ *
+ * 实际方向反了的话交换下面 MotorLeft/MotorRight 的正负号。
+ */
+static void PivotTurn(int8_t dir)
+{
+    if (dir > 0) {
+        MotorLeft( CORNER_SPEED);
+        MotorRight(-CORNER_PIVOT_PWR);
+    } else if (dir < 0) {
+        MotorLeft(-CORNER_PIVOT_PWR);
+        MotorRight( CORNER_SPEED);
+    } else {
+        /* dir==0 不应发生, 防御: 直走 */
+        MotorLeft( CORNER_SPEED);
+        MotorRight( CORNER_SPEED);
+    }
+}
+
 /* ============================================================================
  * LineWalk — 主循线逻辑 (每 10ms 调用一次, 100Hz)
  *
- * 拐弯状态机:
- *   [直道] ──X1或X8触发──→ [拐弯]  锁定转向方向, 写死最大差速
- *   [拐弯] ──X4/X5连续N帧居中──→ [直道]
- *
- * 直道: X2~X7全参与, 低KP+高KD, 温柔纠偏防摆头
- * 拐弯: 无PD, 固定最大差速, 死转到底
+ * 拐弯三阶段状态机:
+ *   阶段0 [直道]       → PD纠偏, 检测X1/X8触发
+ *   阶段1 [拐弯-锁定]   → Pivot原地转, 不检测退出, 倒数MIN_CORNER_LOCK帧
+ *   阶段2 [拐弯-检测]   → 继续Pivot, 检测连续N帧中线居中
+ *   阶段3 [退出后增强]  → PD高KP纠偏, 倒数POST_CORNER_FRAMES帧, 回到直道
  * ============================================================================ */
 static void LineWalk(void)
 {
@@ -304,12 +348,14 @@ static void LineWalk(void)
     int16_t speed, pd_out;
 
     /* 持久状态 */
-    static uint8_t in_corner       = 0;
-    static uint8_t corner_enter_cnt = 0;
-    static uint8_t corner_exit_cnt  = 0;
-    static int8_t  last_err        = 0;
-    static uint8_t lost_cnt        = 0;
-    static int8_t  corner_dir      = 0;  /* 1=右转, -1=左转 */
+    static uint8_t  mode             = 0;   /* 0=直道 1=拐弯锁定 2=拐弯检测 3=退出增强 */
+    static uint8_t  corner_enter_cnt = 0;
+    static uint8_t  corner_exit_cnt  = 0;
+    static uint16_t corner_frame     = 0;   /* 拐弯内帧计数 */
+    static uint8_t  post_frame       = 0;   /* 退出增强帧计数 */
+    static int8_t   corner_dir       = 0;   /* 1=右转, -1=左转 */
+    static int8_t   last_err         = 0;
+    static uint8_t  lost_cnt         = 0;
 
     /* 1. 读传感器 */
     ReadIR(ir);
@@ -317,63 +363,110 @@ static void LineWalk(void)
     /* 2. 计算偏差 */
     err = CalcError(ir);
 
-    /* 3. 丢线恢复 */
-    if (IsLineLost(ir)) {
-        if (in_corner) {
-            /* 拐弯中丢线: 沿锁死方向继续, 不等渐进搜索 */
-            err = (corner_dir > 0) ? 7 : ((corner_dir < 0) ? -7 : 0);
-        } else {
-            /* 直道丢线: 沿上次方向渐进搜索 */
-            lost_cnt += LOST_STEP;
-            if (lost_cnt > LOST_MAX) lost_cnt = LOST_MAX;
-            if (last_err > 0)      err =  lost_cnt;
-            else if (last_err < 0) err = -lost_cnt;
-            else                   err = 0;
-        }
-    } else {
+    /* 3. 丢线恢复 (仅直道生效; 拐弯内由pivot接管) */
+    if (mode == 0 && IsLineLost(ir)) {
+        lost_cnt += LOST_STEP;
+        if (lost_cnt > LOST_MAX) lost_cnt = LOST_MAX;
+        if (last_err > 0)      err =  lost_cnt;
+        else if (last_err < 0) err = -lost_cnt;
+        else                   err = 0;
+    }
+    if (!IsLineLost(ir)) {
         lost_cnt = 0;
         last_err = err;
     }
 
-    /* 4. 拐弯状态机 */
-    if (!in_corner) {
+    /* ==================================================================
+     * 4. 拐弯状态机
+     * ================================================================== */
+
+    switch (mode) {
+
+    /* ---- 阶段0: 直道 ---- */
+    case 0:
         if (IsCornerEntry(ir)) {
             corner_enter_cnt++;
             if (corner_enter_cnt >= CORNER_DEBOUNCE) {
-                in_corner = 1;
+                /* 进入拐弯-锁定阶段 */
+                mode = 1;
+                corner_frame = 0;
                 corner_exit_cnt = 0;
-                corner_dir = (err > 0) ? 1 : -1;  /* 锁死转向方向 */
+
+                /* 根据哪一侧传感器触发决定转向 */
+                if (ir[0] == ACTIVE_LEVEL && ir[7] != ACTIVE_LEVEL)
+                    corner_dir = -1;  /* X1单触发 → 左转 */
+                else if (ir[7] == ACTIVE_LEVEL && ir[0] != ACTIVE_LEVEL)
+                    corner_dir =  1;  /* X8单触发 → 右转 */
+                else
+                    corner_dir = (err >= 0) ? 1 : -1;  /* 兜底: 按偏差符号 */
             }
         } else {
             corner_enter_cnt = 0;
         }
-    } else {
+        break;
+
+    /* ---- 阶段1: 拐弯-锁定 (强制pivot, 不检测退出) ---- */
+    case 1:
+        corner_frame++;
+        if (corner_frame >= MIN_CORNER_LOCK) {
+            mode = 2;  /* 锁定结束, 进入检测阶段 */
+            corner_exit_cnt = 0;
+        }
+        break;
+
+    /* ---- 阶段2: 拐弯-检测 (继续pivot, 检测居中退出) ---- */
+    case 2:
+        corner_frame++;
         if (IsLineCentered(ir)) {
             corner_exit_cnt++;
             if (corner_exit_cnt >= CORNER_EXIT_COUNT) {
-                in_corner = 0;
-                corner_enter_cnt = 0;
-                corner_dir = 0;
+                mode = 3;
+                post_frame = 0;
+                PD_Reset();
             }
         } else {
             corner_exit_cnt = 0;
         }
+        if (corner_frame >= CORNER_MAX_FRAMES) {
+            mode = 3;
+            post_frame = 0;
+            PD_Reset();
+        }
+        break;
+
+    /* ---- 阶段3: 退出后增强纠偏 (高KP PD, 快速归中线) ---- */
+    case 3:
+        post_frame++;
+        if (post_frame >= POST_CORNER_FRAMES) {
+            mode = 0;
+            corner_enter_cnt = 0;
+            corner_dir = 0;
+        }
+        break;
     }
 
-    /* 5. 速度 + PD差速 */
-    if (in_corner) {
-        speed  = CORNER_SPEED;
-        pd_out = PD_Calc(err, KP_CORNER, KD_CORNER);
+    /* ==================================================================
+     * 5. 执行驱动
+     * ================================================================== */
+
+    if (mode == 1 || mode == 2) {
+        /* 拐弯锁定+检测: 固定pivot旋转 */
+        PivotTurn(corner_dir);
+    } else if (mode == 3) {
+        /* 退出增强: 中速 + 高KP PD */
+        speed  = STRAIGHT_SPEED;
+        pd_out = PD_Calc(err, POST_CORNER_KP, KD_STRAIGHT);
+        if (pd_out >  speed) pd_out =  speed;
+        if (pd_out < -speed) pd_out = -speed;
+        CarMove(speed, pd_out);
     } else {
+        /* 直道: 低速 + 低KP/高KD PD */
         speed  = STRAIGHT_SPEED;
         pd_out = PD_Calc(err, KP_STRAIGHT, KD_STRAIGHT);
+        if (pd_out >  speed) pd_out =  speed;
+        if (pd_out < -speed) pd_out = -speed;
+        CarMove(speed, pd_out);
     }
-
-    /* 6. 限幅后差速驱动 */
-    if (pd_out >  speed) pd_out =  speed;
-    if (pd_out < -speed) pd_out = -speed;
-
-    CarMove(speed, pd_out);
 }
 
 /* ============================================================================
