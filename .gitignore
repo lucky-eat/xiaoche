@@ -1,0 +1,20 @@
+# Build outputs
+Debug/
+
+# Clangd cache
+.clangd/.cache/
+
+# IDE files
+.theia/
+.claude/
+
+# Generated docs
+README.html
+
+# Compiled object files
+*.o
+*.out
+*.map
+*.d
+*_linkInfo.xml
+Event.dot
